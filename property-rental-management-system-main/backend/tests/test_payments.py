@@ -1,0 +1,159 @@
+import os
+import unittest
+from datetime import datetime, timezone
+
+
+# Must be configured before importing the application factory.
+os.environ['DATABASE_URL'] = 'sqlite://'
+
+from flask_jwt_extended import create_access_token
+
+from app import create_app
+from app.extensions import db
+from app.models import Alert, Payment, Unit, User
+from app.services.demo_data import repair_documented_demo_payments
+
+
+class PaymentInstallmentTests(unittest.TestCase):
+    def setUp(self):
+        self.app = create_app()
+        self.app.config.update(TESTING=True)
+        self.context = self.app.app_context()
+        self.context.push()
+        db.create_all()
+
+        self.manager = User(
+            name='Test Manager',
+            email='manager@example.com',
+            role='manager',
+        )
+        self.manager.set_password('test-password')
+        db.session.add(self.manager)
+        db.session.flush()
+
+        self.unit = Unit(
+            manager_id=self.manager.id,
+            unit_number='A-101',
+            address='Test address',
+            rent_amount=15000,
+            tenant_name='Test Tenant',
+        )
+        db.session.add(self.unit)
+        db.session.commit()
+
+        token = create_access_token(
+            identity=self.manager.id,
+            additional_claims={'role': 'manager'},
+        )
+        self.client = self.app.test_client()
+        self.headers = {'Authorization': f'Bearer {token}'}
+        self.month = datetime.now(timezone.utc).strftime('%Y-%m')
+
+    def test_manager_can_log_in(self):
+        response = self.client.post('/api/auth/login', json={
+            'email': 'manager@example.com',
+            'password': 'test-password',
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['user']['role'], 'manager')
+        self.assertTrue(response.get_json()['access_token'])
+
+    def tearDown(self):
+        db.session.remove()
+        db.drop_all()
+        db.engine.dispose()
+        self.context.pop()
+
+    def test_installments_are_classified_by_their_monthly_total(self):
+        first = self.client.post(
+            '/api/payments/bulk',
+            json={'payments': [{
+                'unit_id': self.unit.id,
+                'amount_paid': 13000,
+                'month_covered': self.month,
+            }]},
+            headers=self.headers,
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(first.get_json()['summary']['underpaid'], 1)
+
+        db.session.add(Alert(
+            unit_id=self.unit.id,
+            month_covered=self.month,
+            reason='underpaid',
+        ))
+        db.session.commit()
+
+        # A rent increase after the first installment belongs to the next
+        # month; it must not change this month's ₹15,000 agreement.
+        self.unit.rent_amount = 20000
+        db.session.commit()
+
+        second = self.client.post(
+            '/api/payments/bulk',
+            json={'payments': [{
+                'unit_id': self.unit.id,
+                'amount_paid': 2000,
+                'month_covered': self.month,
+            }]},
+            headers=self.headers,
+        )
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second.get_json()['summary']['matched'], 1)
+
+        payments = self.client.get('/api/payments', headers=self.headers).get_json()['payments']
+        self.assertEqual(len(payments), 2)
+        self.assertEqual({payment['match_status'] for payment in payments}, {'matched'})
+
+        dashboard = self.client.get('/api/dashboard/summary', headers=self.headers).get_json()
+        self.assertEqual(dashboard['rent']['total_collected_this_month'], 15000)
+        self.assertEqual(dashboard['rent']['underpaid_count'], 0)
+        self.assertEqual(
+            self.client.get('/api/alerts', headers=self.headers).get_json()['alerts'],
+            [],
+        )
+
+        # Simulate a record saved by the old code. The list endpoint must
+        # still show the actual monthly result before the migration runs.
+        Payment.query.filter_by(unit_id=self.unit.id, month_covered=self.month).update({
+            'match_status': 'underpaid'
+        })
+        db.session.commit()
+        payment_history = self.client.get('/api/payments', headers=self.headers).get_json()['payments']
+        self.assertEqual({payment['match_status'] for payment in payment_history}, {'matched'})
+
+    def test_legacy_demo_payment_is_replaced_with_completed_installments(self):
+        demo_unit = Unit(
+            manager_id=self.manager.id,
+            unit_number='A-102',
+            address='Demo address',
+            rent_amount=18500,
+            tenant_name='Demo Tenant',
+        )
+        db.session.add(demo_unit)
+        db.session.flush()
+        db.session.add(Payment(
+            unit_id=demo_unit.id,
+            amount_paid=18500,
+            expected_amount=18500,
+            month_covered=self.month,
+            match_status='matched',
+            recorded_by=self.manager.id,
+        ))
+        db.session.commit()
+
+        repair_documented_demo_payments(self.manager.id)
+        db.session.commit()
+
+        payments = Payment.query.filter_by(
+            unit_id=demo_unit.id,
+            month_covered=self.month,
+        ).all()
+        self.assertEqual(float(demo_unit.rent_amount), 15000)
+        self.assertEqual(sorted(float(payment.amount_paid) for payment in payments), [2000, 13000])
+        self.assertEqual({payment.match_status for payment in payments}, {'matched'})
+
+
+if __name__ == '__main__':
+    unittest.main()

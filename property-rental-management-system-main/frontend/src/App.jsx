@@ -1,0 +1,136 @@
+import { lazy, Suspense } from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { AuthProvider, useAuth } from './context/AuthContext';
+
+import Layout from './components/Layout';
+
+const Login = lazy(() => import('./pages/Login'));
+const Signup = lazy(() => import('./pages/Signup'));
+const Units = lazy(() => import('./pages/Units'));
+const Requests = lazy(() => import('./pages/Requests'));
+const Payments = lazy(() => import('./pages/Payments'));
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Alerts = lazy(() => import('./pages/Alerts'));
+
+function PageLoader() {
+  return <div className="flex min-h-screen items-center justify-center bg-slate-50 text-sm text-slate-400">Loading...</div>;
+}
+
+function ProtectedRoute({ children, managerOnly = false }) {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50">
+        <p className="text-sm text-slate-400">Loading...</p>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
+
+  if (managerOnly && user.role !== 'manager') {
+    return <Navigate to="/requests" replace />;
+  }
+
+  return <Layout>{children}</Layout>;
+}
+
+function RoleBasedRedirect() {
+  const { user, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50">
+        <p className="text-sm text-slate-400">Loading...</p>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return (
+    <Navigate
+      to={user.role === 'manager' ? '/dashboard' : '/requests'}
+      replace
+    />
+  );
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <Suspense fallback={<PageLoader />}>
+        <Routes>
+          {/* Public routes */}
+          <Route path="/login" element={<Login />} />
+          <Route path="/signup" element={<Signup />} />
+
+          {/* Dashboard */}
+          <Route
+            path="/dashboard"
+            element={
+              <ProtectedRoute managerOnly>
+                <Dashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Units */}
+          <Route
+            path="/units"
+            element={
+              <ProtectedRoute managerOnly>
+                <Units />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Maintenance / My Requests */}
+          <Route
+            path="/requests"
+            element={
+              <ProtectedRoute>
+                <Requests />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Rent / Payments */}
+          <Route
+            path="/payments"
+            element={
+              <ProtectedRoute managerOnly>
+                <Payments />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Alerts */}
+          <Route
+            path="/alerts"
+            element={
+              <ProtectedRoute managerOnly>
+                <Alerts />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Root URL */}
+          <Route path="/" element={<RoleBasedRedirect />} />
+
+          {/* Any unknown URL */}
+          <Route path="*" element={<RoleBasedRedirect />} />
+        </Routes>
+        </Suspense>
+      </AuthProvider>
+    </BrowserRouter>
+  );
+}
+
+export default App;
